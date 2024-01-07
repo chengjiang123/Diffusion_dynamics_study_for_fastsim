@@ -208,10 +208,53 @@ class CaloDiffu(nn.Module):
 
         if(self.discrete_time): 
             if(t is None): t = torch.randint(0, self.nsteps, (data.size()[0],), device=data.device).long()
+
+                
+            if(rnd_normal is None): rnd_normal = torch.randn_like(data, device=data.device)
+            
             x_noisy = self.noise_image(data, t, noise=noise)
             sigma = None
             sigma2 = extract(self.sqrt_one_minus_alphas_cumprod, t, data.shape)**2
-            #print('use default')
+            if loss_type == 'pd':
+                #t = 2*torch.randint(0, (self.nsteps//self.factor), (data.size()[0],), device=data.device).long()
+                alpha_t,sigma_t = self.get_alpha_sigma(data,t+1)
+                sigma_t1 = torch.sqrt(1-alpha_t**2)
+                #print('alpha_t{}'.format(alpha_t.reshape(-1)))
+                #print('sigma_t{}'.format(sigma_t.reshape(-1)))
+                #print('sigma_t1{}'.format(sigma_t1.reshape(-1)))
+                #sigma_t = extract(self.sqrt_one_minus_alphas_cumprod, t+1, data.shape)
+
+                z_t = alpha_t * data + torch.reshape(sigma_t, (data.shape[0], 1,1,1,1)) * rnd_normal
+                #print('z_t{}'.format(z_t))
+                alpha_s,sigma_s = self.CaloDiffuModel.get_alpha_sigma(x=data, t=t//2)
+                #sigma_s = self.CaloDiffuModel.sqrt_one_minus_alphas_cumprod1(t=t//2, data=data)
+                #print('alpha_s{}'.format(alpha_s.reshape(-1)))
+                #print('sigma_s{}'.format(sigma_s.reshape(-1)))
+                alpha_1,sigma_1 = self.get_alpha_sigma(data,t)
+                #sigma_1 = extract(self.sqrt_alphas_cumprod, t, data.shape)
+
+                t_emb_t = self.do_time_embed(t+1, self.time_embed, sigma)
+                pred_t = self.pred(z_t, energy, t_emb_t)
+                rec = (alpha_t * z_t - sigma_t * pred_t).clip(-1, 1)
+                z_1 = alpha_1 * rec + (sigma_1 / sigma_t) * (z_t - alpha_t * rec)
+
+                t_emb_1 = self.do_time_embed(t, self.time_embed, sigma)
+                #print(t_emb_1.shape)
+                pred_1 = self.pred(z_1, energy, t_emb_1)
+
+                x_2 = (alpha_1 * z_1 - sigma_1 * pred_1).clip(-1, 1)
+                
+                eps_2 = (z_t - alpha_s * x_2) / sigma_s
+                #print('alphas{}'.format(alpha_s.shape))
+                #print('eps_2{}'.format(eps_2.shape))
+                #print('sigma_s{}'.format(sigma_s.shape))
+                #print('x_2{}'.format(x_2.shape))
+                v_2 = alpha_s * eps_2 - sigma_s * x_2
+
+                if self.gamma == 0:
+                    weight_pd = 1
+                else:
+                    weight_pd = torch.pow(1 + alpha_s / sigma_s, self.gamma)
         else:
             if(rnd_normal is None): rnd_normal = torch.randn((data.size()[0],), device=data.device)
             sigma = (rnd_normal * self.P_std + self.P_mean).exp()
@@ -264,6 +307,10 @@ class CaloDiffu(nn.Module):
 
         elif loss_type == "huber":
             loss =torch.nn.functional.smooth_l1_loss(target, pred)
+        elif loss_type == "pd":
+            
+            #don't use weighted loss, since the alpha_s/sigma_s would blow up
+            loss = torch.nn.functional.mse_loss((weight_pd * v_2), (weight_pd * pred_pd))
         else:
             raise NotImplementedError()
 
